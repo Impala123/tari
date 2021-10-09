@@ -306,6 +306,7 @@ impl Dht {
             )))
             .layer(inbound::DecryptionLayer::new(
                 self.config.clone(),
+                self.dht_requester(),
                 self.node_identity.clone(),
                 self.connectivity.clone(),
             ))

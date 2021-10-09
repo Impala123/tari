@@ -100,6 +100,12 @@ pub enum DhtRequest {
         received_from: CommsPublicKey,
         reply_tx: oneshot::Sender<u32>,
     },
+    /// Remove message signature from cache.
+    MsgHashCacheRemove {
+        message_hash: Vec<u8>,
+        received_from: CommsPublicKey,
+        reply_tx: oneshot::Sender<bool>,
+    },
     GetMsgHashHitCount(Vec<u8>, oneshot::Sender<u32>),
     /// Fetch selected peers according to the broadcast strategy
     SelectPeers(BroadcastStrategy, oneshot::Sender<Vec<NodeId>>),
@@ -122,12 +128,23 @@ impl Display for DhtRequest {
                 message_hash.to_hex(),
                 received_from.to_hex(),
             ),
+            MsgHashCacheRemove {
+                message_hash,
+                received_from,
+                ..
+            } => write!(
+                f,
+                "MsgHashCacheRemove(message hash: {}, received from: {})",
+                message_hash.to_hex(),
+                received_from.to_hex(),
+            ),
             GetMsgHashHitCount(hash, _) => write!(f, "GetMsgHashHitCount({})", hash.to_hex()),
             SelectPeers(s, _) => write!(f, "SelectPeers (Strategy={})", s),
             GetMetadata(key, _) => write!(f, "GetMetadata (key={})", key),
             SetMetadata(key, value, _) => {
                 write!(f, "SetMetadata (key={}, value={} bytes)", key, value.len())
             },
+
         }
     }
 }
@@ -162,6 +179,23 @@ impl DhtRequester {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(DhtRequest::MsgHashCacheInsert {
+                message_hash,
+                received_from,
+                reply_tx,
+            })
+            .await?;
+
+        reply_rx.await.map_err(|_| DhtActorError::ReplyCanceled)
+    }
+
+    pub async fn remove_message_from_dedup_cache(
+        &mut self,
+        message_hash: Vec<u8>,
+        received_from: CommsPublicKey,
+    ) -> Result<bool, DhtActorError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(DhtRequest::MsgHashCacheRemove {
                 message_hash,
                 received_from,
                 reply_tx,
@@ -333,6 +367,28 @@ impl DhtActor {
                                 "Unable to update message dedup cache because {:?}", err
                             );
                             let _ = reply_tx.send(0);
+                        },
+                    }
+                    Ok(())
+                })
+            },
+            MsgHashCacheRemove {
+                message_hash,
+                received_from: _,
+                reply_tx,
+            } => {
+                let msg_hash_cache = self.msg_hash_dedup_cache.clone();
+                Box::pin(async move {
+                    match msg_hash_cache.remove_body_hash(message_hash).await {
+                        Ok(success) => {
+                            let _ = reply_tx.send(success);
+                        },
+                        Err(err) => {
+                            warn!(
+                                target: LOG_TARGET,
+                                "Unable to remove message from dedup cache because {:?}", err
+                            );
+                            let _ = reply_tx.send(false);
                         },
                     }
                     Ok(())
@@ -797,6 +853,48 @@ mod test {
         assert_eq!(num_hits, 2);
         let num_hits = requester
             .add_message_to_dedup_cache(Vec::new(), CommsPublicKey::default())
+            .await
+            .unwrap();
+        assert_eq!(num_hits, 1);
+    }
+
+    #[runtime::test]
+    async fn remove_message_signature() {
+        let node_identity = make_node_identity();
+        let peer_manager = build_peer_manager();
+        let (connectivity_manager, mock) = create_connectivity_mock();
+        mock.spawn();
+        let (out_tx, _) = mpsc::channel(1);
+        let (actor_tx, actor_rx) = mpsc::channel(1);
+        let mut requester = DhtRequester::new(actor_tx);
+        let outbound_requester = OutboundMessageRequester::new(out_tx);
+        let shutdown = Shutdown::new();
+        let actor = DhtActor::new(
+            Default::default(),
+            db_connection().await,
+            node_identity,
+            peer_manager,
+            connectivity_manager,
+            outbound_requester,
+            actor_rx,
+            shutdown.to_signal(),
+        );
+
+        actor.spawn();
+
+        let signature = vec![1u8, 2, 3];
+        let num_hits = requester
+            .add_message_to_dedup_cache(signature.clone(), CommsPublicKey::default())
+            .await
+            .unwrap();
+        assert_eq!(num_hits, 1);
+        let result = requester
+            .remove_message_from_dedup_cache(signature.clone(), CommsPublicKey::default())
+            .await
+            .unwrap();
+        assert_eq!(result, true);
+        let num_hits = requester
+            .add_message_to_dedup_cache(signature, CommsPublicKey::default())
             .await
             .unwrap();
         assert_eq!(num_hits, 1);

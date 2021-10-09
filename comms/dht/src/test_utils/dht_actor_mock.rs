@@ -44,6 +44,7 @@ pub fn create_dht_actor_mock(buf_size: usize) -> (DhtRequester, DhtActorMock) {
 #[derive(Default, Debug, Clone)]
 pub struct DhtMockState {
     signature_cache_insert: Arc<AtomicUsize>,
+    signature_cache_remove: Arc<AtomicUsize>,
     call_count: Arc<AtomicUsize>,
     select_peers: Arc<RwLock<Vec<Peer>>>,
     settings: Arc<RwLock<HashMap<String, Vec<u8>>>>,
@@ -108,6 +109,10 @@ impl DhtActorMock {
             MsgHashCacheInsert { reply_tx, .. } => {
                 let v = self.state.signature_cache_insert.load(Ordering::SeqCst);
                 reply_tx.send(v as u32).unwrap();
+            },
+            MsgHashCacheRemove { reply_tx, .. } => {
+                self.state.signature_cache_remove.load(Ordering::SeqCst);
+                reply_tx.send(true).unwrap();
             },
             GetMsgHashHitCount(_, reply_tx) => {
                 let v = self.state.signature_cache_insert.load(Ordering::SeqCst);

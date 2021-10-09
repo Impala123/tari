@@ -72,6 +72,40 @@ impl DedupCacheDatabase {
         Ok(hit_count)
     }
 
+    /// Remove the given body hash from the cache.
+    /// If a message has been tampered with, any correct version would be ignored.
+    pub async fn remove_body_hash(&self, body_hash: Vec<u8>) -> Result<bool, StorageError> {
+        let update_count = self
+            .connection
+            .with_connection_async(move |conn| {
+                //TODO: DELETE or UPDATE with --1?
+                // Since there is a counter for this it may be better to decrease the count rather than deleting
+                // Could also do that depending on some new param based on allowed_message_occurrences == 1
+                let result = diesel::sql_query(
+                    "UPDATE dedup_cache SET number_of_hits = MAX(0,(number_of_hits-1)) WHERE body_hash = $1",
+                    // UPDATE dedup_cache SET number_of_hits = MAX(0,(number_of_hits-1)) WHERE body_hash = $1 RETURNING number_of_hits
+                    // "DELETE FROM dedup_cache WHERE body_hash = $1",
+                )
+                .bind::<sql_types::Text, _>(body_hash.to_hex())
+                .execute(conn)?;
+
+                debug!(
+                    target: LOG_TARGET,
+                    "Remove from dedup cache: body_hash {}, updated {}", body_hash.to_hex(), result,
+                );
+                Ok(result)
+            })
+            .await?;
+
+        if update_count == 0 {
+            warn!(
+                target: LOG_TARGET,
+                "Unable to remove specified message from dedup cache"
+            );
+        }
+        Ok(update_count > 0)
+    }
+
     pub async fn get_hit_count(&self, body_hash: Vec<u8>) -> Result<u32, StorageError> {
         let hit_count = self
             .connection

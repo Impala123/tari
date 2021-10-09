@@ -20,13 +20,7 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use crate::{
-    crypt,
-    envelope::DhtMessageHeader,
-    inbound::message::{DecryptedDhtMessage, DhtInboundMessage},
-    proto::envelope::OriginMac,
-    DhtConfig,
-};
+use crate::{crypt, envelope::DhtMessageHeader, inbound::message::{DecryptedDhtMessage, DhtInboundMessage}, proto::envelope::OriginMac, DhtConfig, DhtRequester};
 use futures::{future::BoxFuture, task::Context};
 use log::*;
 use prost::Message;
@@ -70,14 +64,16 @@ enum DecryptionError {
 /// This layer is responsible for attempting to decrypt inbound messages.
 pub struct DecryptionLayer {
     node_identity: Arc<NodeIdentity>,
+    dht_requester: DhtRequester,
     connectivity: ConnectivityRequester,
     config: DhtConfig,
 }
 
 impl DecryptionLayer {
-    pub fn new(config: DhtConfig, node_identity: Arc<NodeIdentity>, connectivity: ConnectivityRequester) -> Self {
+    pub fn new(config: DhtConfig, dht_requester: DhtRequester, node_identity: Arc<NodeIdentity>, connectivity: ConnectivityRequester) -> Self {
         Self {
             node_identity,
+            dht_requester,
             connectivity,
             config,
         }
@@ -90,6 +86,7 @@ impl<S> Layer<S> for DecryptionLayer {
     fn layer(&self, service: S) -> Self::Service {
         DecryptionService::new(
             self.config.clone(),
+            self.dht_requester.clone(),
             self.node_identity.clone(),
             self.connectivity.clone(),
             service,
@@ -101,6 +98,7 @@ impl<S> Layer<S> for DecryptionLayer {
 #[derive(Clone)]
 pub struct DecryptionService<S> {
     config: DhtConfig,
+    dht_requester: DhtRequester,
     node_identity: Arc<NodeIdentity>,
     connectivity: ConnectivityRequester,
     inner: S,
@@ -109,12 +107,14 @@ pub struct DecryptionService<S> {
 impl<S> DecryptionService<S> {
     pub fn new(
         config: DhtConfig,
+        dht_requester: DhtRequester,
         node_identity: Arc<NodeIdentity>,
         connectivity: ConnectivityRequester,
         service: S,
     ) -> Self {
         Self {
             node_identity,
+            dht_requester,
             connectivity,
             config,
             inner: service,
@@ -138,6 +138,7 @@ where
     fn call(&mut self, msg: DhtInboundMessage) -> Self::Future {
         Box::pin(Self::handle_message(
             self.inner.clone(),
+            self.dht_requester.clone(),
             Arc::clone(&self.node_identity),
             self.connectivity.clone(),
             self.config.ban_duration,
@@ -151,6 +152,7 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError>
 {
     async fn handle_message(
         next_service: S,
+        mut dht_requester: DhtRequester,
         node_identity: Arc<NodeIdentity>,
         mut connectivity: ConnectivityRequester,
         ban_duration: Duration,
@@ -160,6 +162,7 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError>
         let source = message.source_peer.clone();
         let trace_id = message.dht_header.message_tag;
         let tag = message.tag;
+        let hash = crate::dedup::hash_inbound_message(&message);
         match Self::validate_and_decrypt_message(node_identity, message).await {
             Ok(msg) => {
                 trace!(target: LOG_TARGET, "Passing onto next service (Trace: {})", msg.tag);
@@ -174,6 +177,13 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError>
                 connectivity
                     .ban_peer_until(source.node_id.clone(), ban_duration, err.to_string())
                     .await?;
+
+                // If the message was tampered with it should be removed from the dedup cache
+                dht_requester.remove_message_from_dedup_cache(
+                    hash,
+                    source.public_key.clone()
+                ).await?;
+
                 Err(err.into())
             },
             Err(EnvelopeBodyDecodeFailed) => {
@@ -184,6 +194,14 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError>
                     source.node_id,
                     trace_id
                 );
+
+                //TODO: should this case lead to removal from the dedup cache?
+                // If the message was tampered with it should be removed from the dedup cache
+                dht_requester.remove_message_from_dedup_cache(
+                    hash,
+                    source.public_key.clone()
+                ).await?;
+
                 Ok(())
             },
             Err(err) => Err(err.into()),
@@ -402,7 +420,7 @@ mod test {
     use super::*;
     use crate::{
         envelope::DhtMessageFlags,
-        test_utils::{make_dht_inbound_message, make_node_identity},
+        test_utils::{create_dht_actor_mock, make_dht_inbound_message, make_node_identity},
     };
     use futures::{executor::block_on, future};
     use std::sync::Mutex;
@@ -417,10 +435,11 @@ mod test {
 
     #[test]
     fn poll_ready() {
+        let (dht_requester, _mock) = create_dht_actor_mock(1);
         let service = service_fn(|_: DecryptedDhtMessage| future::ready(Result::<(), PipelineError>::Ok(())));
         let node_identity = make_node_identity();
         let (connectivity, _) = create_connectivity_mock();
-        let mut service = DecryptionService::new(Default::default(), node_identity, connectivity, service);
+        let mut service = DecryptionService::new(Default::default(), dht_requester, node_identity, connectivity, service);
 
         counter_context!(cx, counter);
 
@@ -432,6 +451,7 @@ mod test {
     #[test]
     fn decrypt_inbound_success() {
         let result = Arc::new(Mutex::new(None));
+        let (dht_requester, _mock) = create_dht_actor_mock(1);
         let service = service_fn({
             let result = result.clone();
             move |msg: DecryptedDhtMessage| {
@@ -441,7 +461,7 @@ mod test {
         });
         let node_identity = make_node_identity();
         let (connectivity, _) = create_connectivity_mock();
-        let mut service = DecryptionService::new(Default::default(), node_identity.clone(), connectivity, service);
+        let mut service = DecryptionService::new(Default::default(), dht_requester, node_identity.clone(), connectivity, service);
 
         let plain_text_msg = wrap_in_envelope_body!(b"Secret plans".to_vec());
         let inbound_msg = make_dht_inbound_message(
@@ -461,6 +481,7 @@ mod test {
     #[test]
     fn decrypt_inbound_fail() {
         let result = Arc::new(Mutex::new(None));
+        let (dht_requester, _mock) = create_dht_actor_mock(1);
         let service = service_fn({
             let result = result.clone();
             move |msg: DecryptedDhtMessage| {
@@ -470,7 +491,7 @@ mod test {
         });
         let node_identity = make_node_identity();
         let (connectivity, _) = create_connectivity_mock();
-        let mut service = DecryptionService::new(Default::default(), node_identity, connectivity, service);
+        let mut service = DecryptionService::new(Default::default(), dht_requester, node_identity, connectivity, service);
 
         let some_secret = b"Super secret message".to_vec();
         let some_other_node_identity = make_node_identity();
@@ -492,6 +513,7 @@ mod test {
     #[runtime::test]
     async fn decrypt_inbound_fail_destination() {
         let _ = env_logger::try_init();
+        let (dht_requester, _mock) = create_dht_actor_mock(1);
         let (connectivity, mock) = create_connectivity_mock();
         mock.spawn();
         let result = Arc::new(Mutex::new(None));
@@ -503,7 +525,7 @@ mod test {
             }
         });
         let node_identity = make_node_identity();
-        let mut service = DecryptionService::new(Default::default(), node_identity.clone(), connectivity, service);
+        let mut service = DecryptionService::new(Default::default(), dht_requester, node_identity.clone(), connectivity, service);
 
         let nonsense = b"Cannot Decrypt this".to_vec();
         let inbound_msg =

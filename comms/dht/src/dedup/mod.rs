@@ -35,7 +35,7 @@ use tower::{layer::Layer, Service, ServiceExt};
 
 const LOG_TARGET: &str = "comms::dht::dedup";
 
-fn hash_inbound_message(message: &DhtInboundMessage) -> Vec<u8> {
+pub fn hash_inbound_message(message: &DhtInboundMessage) -> Vec<u8> {
     Challenge::new().chain(&message.body).finalize().to_vec()
 }
 
